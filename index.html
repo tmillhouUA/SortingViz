@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sorting Visualizer</title>
+<style>
+  /* ============================================================
+     Theme and layout constants.
+     Sizes use vw/vh so everything scales with the window
+     (important for projectors / big screens).
+     ============================================================ */
+  :root {
+    --n: 40;                    /* number of columns (kept in sync with N in JS) */
+    --denim: #1560BD;           /* bar color */
+    --ink: #222;                /* text / focus-box color */
+    --num-h: 5vh;               /* height of the number row */
+    --box-line: 3px;            /* line width of the dotted focus boxes */
+    --lift-full: -3vh;          /* vertical offset when an item is "picked up" */
+    --lift-half: -1.5vh;        /* offset for items being examined / slid aside */
+    --font: clamp(14px, 1.4vw, 40px);
+  }
+
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #fff;
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+
+  body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-end;
+    padding-bottom: 4vh;
+    box-sizing: border-box;
+  }
+
+  /* Title sits at the top; margin-bottom: auto takes up the free space in
+     the flex column, so everything else stays anchored to the bottom. */
+  #title {
+    margin: 3vh 0 auto;
+    font-size: calc(var(--font) * 1.5);
+    font-weight: 600;
+  }
+
+  /* The stage holds bars+numbers and the arrow row; both share its width,
+     so overlay positions (in % of width) line up with the columns. */
+  #stage {
+    width: 94vw;
+  }
+
+  /* ---------- Bars + numbers area ---------- */
+  #barsArea {
+    position: relative;
+    height: 68vh;
+  }
+
+  /* One column = one bar + its number. Columns are absolutely positioned
+     and moved horizontally with translateX. Note: a percentage inside
+     translateX is relative to the element's OWN width, so
+     translateX(k * 100%) places the column in slot k. */
+  .col {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: calc(100% / var(--n));
+    transition-property: transform;
+    transition-timing-function: ease-in-out;
+    z-index: 1;
+  }
+  .col.half { z-index: 2; }
+  .col.full { z-index: 3; }   /* a fully lifted item passes over half-lifted ones */
+
+  /* The "lift" wrapper handles the vertical pick-up separately from
+     horizontal movement, so the two can be sequenced. */
+  .lift {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    transition-property: transform;
+    transition-timing-function: ease-out;
+  }
+  .col.full .lift { transform: translateY(var(--lift-full)); }
+  .col.half .lift { transform: translateY(var(--lift-half)); }
+
+  .barWrap {
+    flex: 1;
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+  }
+  .bar {
+    width: 72%;
+    background: var(--denim);
+    border-radius: 3px 3px 0 0;
+  }
+
+  .num {
+    height: var(--num-h);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: var(--font);
+    font-weight: 600;
+    background: #fff;             /* a number passing over another hides it */
+    position: relative;           /* anchor for the ::after focus box */
+  }
+  /* Focus box, drawn as a pseudo-element inset by one line width on every
+     side. (Kept as a pseudo-element so per-side insets stay easy to tweak.) */
+  .num::after {
+    content: "";
+    position: absolute;
+    inset: var(--box-line);       /* same inset on all four sides */
+    border: var(--box-line) dotted transparent;
+    pointer-events: none;
+  }
+  /* Trim the text's line box to the digits themselves (cap height down to
+     baseline). Without this, the font's built-in space above the digits is
+     larger than the space below, so they sit low inside the box. */
+  .num span {
+    text-box: trim-both cap alphabetic;
+  }
+  .num.box::after  { border-color: var(--ink); }           /* main focus box */
+  .num.scan::after { border-color: rgba(0, 0, 0, 0.3); }   /* lighter "being checked" box */
+
+  /* ---------- Overlays (focus indicators) ---------- */
+  .overlay {
+    position: absolute;
+    display: none;
+    transition-property: left;          /* duration is set from JS (see T) */
+    transition-timing-function: ease-in-out;
+    pointer-events: none;
+  }
+  .overlay.show { display: block; }
+
+  /* Bubble sort: dotted box around the pair being compared */
+  #pairBox {
+    bottom: var(--box-line);                          /* same inset as .num::after */
+    height: calc(var(--num-h) - 2 * var(--box-line));
+    /* JS sets `left` to the slot edge; the margin insets the box from it. */
+    margin-left: var(--box-line);
+    width: calc(2 * 100% / var(--n) - 2 * var(--box-line));
+    border: var(--box-line) dotted var(--ink);
+    box-sizing: border-box;
+    z-index: 4;
+  }
+
+  /* Bubble* / Insertion: dotted vertical boundary rule */
+  #rule {
+    top: 0;
+    bottom: 0;
+    width: 0;
+    border-left: 3px dotted rgba(0, 0, 0, 0.45);
+    transform: translateX(-50%);
+    z-index: 4;
+  }
+
+  /* ---------- Arrow row (Selection sort) ---------- */
+  #arrowRow {
+    position: relative;
+    height: 5vh;
+  }
+  #arrow {
+    top: 0.5vh;
+    width: calc(100% / var(--n));
+    text-align: center;
+    font-size: calc(var(--font) * 1.4);
+    line-height: 1;
+  }
+
+  /* ---------- Buttons ---------- */
+  #controls {
+    display: flex;
+    align-items: stretch;
+    gap: 1vw;
+    margin-top: 1vh;
+  }
+  #controls button {
+    font-size: var(--font);
+    padding: 0.6em 1.2em;
+    border: 2px solid #888;
+    border-radius: 8px;
+    background: #f4f4f4;
+    color: var(--ink);
+    cursor: pointer;
+  }
+  #controls button:hover:not(:disabled) { background: #e6e6e6; }
+  #controls button:disabled { opacity: 0.45; cursor: default; }
+  #controls button.active:disabled { opacity: 1; }   /* the running one stays bright */
+  #controls.noDim button:disabled { opacity: 1; }    /* brief actions: disable without dimming */
+  .sep {
+    width: 2px;
+    background: #999;
+    margin: 0 0.5vw;
+  }
+</style>
+</head>
+<body>
+
+  <h1 id="title">Simple Sorting Algorithms</h1>
+
+  <div id="stage">
+    <div id="barsArea">
+      <!-- columns are inserted here by JS -->
+      <div id="pairBox" class="overlay"></div>
+      <div id="rule" class="overlay"></div>
+    </div>
+    <div id="arrowRow">
+      <div id="arrow" class="overlay">&#9650;</div>
+    </div>
+  </div>
+
+  <div id="controls">
+    <button id="btnShuffle">Shuffle</button>
+    <button id="btnDisplace">Displace</button>
+    <div class="sep"></div>
+    <button id="btnBubble">Bubble</button>
+    <button id="btnBubbleStar">Bubble*</button>
+    <button id="btnSelection">Selection</button>
+    <button id="btnInsertion">Insertion</button>
+  </div>
+
+<script>
+// ============================================================
+// Configuration
+// ============================================================
+const N = 40;               // number of items (also set as --n in CSS)
+const DISPLACE_PAIRS = 1;   // adjacent swaps per Displace press
+const verbose = false;      // set true for console logging
+
+// ------------------------------------------------------------
+// Animation timings in milliseconds, grouped by button.
+//   - Motion values (lift, move, drop, ...Slide) set how long a motion takes.
+//   - Pause values set how long things rest AFTER the motion finishes,
+//     before the next step begins.
+// ------------------------------------------------------------
+const T = {
+  displace: {
+    lift: 60,          // pick up both items of a pair
+    move: 130,         // swap their places
+    drop: 60,          // put them down
+    pause: 0,          // rest between pairs
+  },
+
+  bubble: {
+    boxSlide: 60,     // comparison box steps one slot right
+    boxReturn: 300,    // box returns to the left end for the next pass
+    compare: 60,      // rest on each pair once the box arrives
+    lift: 75,         // swap: pick up both
+    move: 150,         // swap: exchange places
+    drop: 75,         // swap: put down
+  },
+
+  bubbleStar: {
+    boxSlide: 60,     // comparison box steps one slot right
+    boxReturn: 300,    // box returns to the left end for the next pass
+    compare: 60,      // rest on each pair once the box arrives
+    lift: 75,         // swap: pick up both
+    move: 150,         // swap: exchange places
+    drop: 75,         // swap: put down
+    ruleSlide: 200,    // boundary rule steps left after each pass
+                       // (happens while the box returns; doesn't add time)
+  },
+
+  selection: {
+    arrowSlide: 200,   // arrow steps to the next swap target
+    targetPause: 100,  // rest once the arrow arrives (first candidate boxed)
+    scan: 120,         // rest on each item checked
+    lift: 75,         // swap: pick up both
+    move: 350,         // swap: exchange places
+    drop: 75,         // swap: put down
+  },
+
+  insertion: {
+    ruleSlide: 200,    // boundary rule steps right (happens while key lifts)
+    keyLift: 75,      // pick up the key
+    keyPause: 150,     // rest once the key is lifted
+    examineLift: 40,  // half-lift an item to compare it with the key
+    examinePause: 40, // rest while it is examined
+    examineDrop: 40,  // set it back down
+    slideLift: 150,    // half-lift all items that need to shift
+    slideMove: 350,    // shift them right; the key moves into the gap together
+    slideDrop: 150,    // set the shifted items down...
+    keyDrop: 150,      // ...while the key is put down (these run together)
+  },
+};
+
+// ============================================================
+// State
+// ============================================================
+// cols[pos] is the column object currently in slot `pos`.
+// Each column: { value, el, numEl }
+let cols = [];
+let running = false;
+
+const barsArea = document.getElementById('barsArea');
+const pairBox  = document.getElementById('pairBox');
+const rule     = document.getElementById('rule');
+const arrow    = document.getElementById('arrow');
+const buttons  = document.querySelectorAll('#controls button');
+const controls = document.getElementById('controls');
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const log = (...args) => { if (verbose) console.log(...args); };
+
+// ============================================================
+// Building and positioning columns
+// ============================================================
+function build() {
+  document.documentElement.style.setProperty('--n', N);
+  for (let v = 1; v <= N; v++) {
+    const el = document.createElement('div');
+    el.className = 'col';
+    el.innerHTML = `
+      <div class="lift">
+        <div class="barWrap"><div class="bar" style="height:${v / N * 100}%"></div></div>
+        <div class="num"><span>${v}</span></div>
+      </div>`;
+    barsArea.appendChild(el);
+    const col = { value: v, el, numEl: el.querySelector('.num') };
+    cols.push(col);
+    placeCol(col, v - 1, 0);
+  }
+}
+
+// Move a column to slot `pos` over `ms` milliseconds (0 = instant).
+function placeCol(col, pos, ms) {
+  col.el.style.transitionDuration = ms + 'ms';
+  col.el.style.transform = `translateX(${pos * 100}%)`;
+}
+
+// Lift a column: level is 'full', 'half', or null (put down).
+function setLift(col, level, ms) {
+  col.el.querySelector('.lift').style.transitionDuration = ms + 'ms';
+  col.el.classList.remove('full', 'half');
+  if (level) col.el.classList.add(level);
+}
+
+// Focus box on a column's number: 'box', 'scan', or null.
+function setBox(col, kind) {
+  col.numEl.classList.remove('box', 'scan');
+  if (kind) col.numEl.classList.add(kind);
+}
+
+// ============================================================
+// Overlays. Positions are in slot units (k = left edge of slot k).
+// When an overlay first appears it jumps into place; afterwards it slides
+// over `ms` milliseconds.
+// ============================================================
+function showOverlay(el, k, ms) {
+  const left = (k * 100 / N) + '%';
+  const firstShow = !el.classList.contains('show');
+  el.style.transitionDuration = (firstShow ? 0 : ms) + 'ms';
+  el.style.left = left;
+  el.classList.add('show');
+}
+function hideOverlay(el) { el.classList.remove('show'); }
+function hideAllOverlays() { [pairBox, rule, arrow].forEach(hideOverlay); }
+
+// ============================================================
+// Basic moves
+// ============================================================
+// Pick up two columns, swap their places, put them down.
+// `t` is a timing group from T with lift, move, and drop values.
+async function swap(i, j, t) {
+  const a = cols[i], b = cols[j];
+  setLift(a, 'full', t.lift); setLift(b, 'full', t.lift);
+  await sleep(t.lift);
+  placeCol(a, j, t.move); placeCol(b, i, t.move);
+  await sleep(t.move);
+  setLift(a, null, t.drop); setLift(b, null, t.drop);
+  await sleep(t.drop);
+  cols[i] = b; cols[j] = a;
+}
+
+// ============================================================
+// Shuffle / Displace
+// ============================================================
+function shuffle() {
+  // Fisher–Yates shuffle, then place everything instantly.
+  for (let i = N - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [cols[i], cols[j]] = [cols[j], cols[i]];
+  }
+  cols.forEach((c, pos) => { setLift(c, null, 0); setBox(c, null); placeCol(c, pos, 0); });
+  hideAllOverlays();
+  log('shuffled:', cols.map(c => c.value).join(' '));
+}
+
+async function displace() {
+  // Swap DISPLACE_PAIRS randomly chosen adjacent pairs of the CURRENT arrangement.
+  for (let k = 0; k < DISPLACE_PAIRS; k++) {
+    const i = Math.floor(Math.random() * (N - 1));
+    log('displace pair', i, i + 1);
+    await swap(i, i + 1, T.displace);
+    await sleep(T.displace.pause);
+  }
+}
+
+// ============================================================
+// Bubble sort
+//   shrink = false: plain bubble with early exit (stop after a pass with no swaps)
+//   shrink = true (Bubble*): also skip the settled tail; a rule marks it
+// ============================================================
+async function bubbleSort(shrink) {
+  const t = shrink ? T.bubbleStar : T.bubble;
+  let end = N;                    // slots [0, end) are still in play
+  while (end > 1) {
+    let swapped = false;
+    for (let i = 0; i < end - 1; i++) {
+      // Step 0 of a pass is the return trip to the left end.
+      const slide = (i === 0) ? t.boxReturn : t.boxSlide;
+      showOverlay(pairBox, i, slide);
+      await sleep(slide + t.compare);
+      if (cols[i].value > cols[i + 1].value) {
+        await swap(i, i + 1, t);
+        swapped = true;
+      }
+    }
+    if (!swapped) break;
+    if (shrink) {
+      end--;
+      showOverlay(rule, end, t.ruleSlide);
+    }
+  }
+  hideAllOverlays();
+}
+
+// ============================================================
+// Selection sort (swap version)
+//   arrow : under the current swap target (slot i)
+//   box   : on the smallest-so-far, travels with it until placed
+//   scan  : lighter box on the item being checked
+// ============================================================
+async function selectionSort() {
+  const t = T.selection;
+  for (let i = 0; i < N - 1; i++) {
+    showOverlay(arrow, i, t.arrowSlide);
+    let min = i;
+    setBox(cols[min], 'box');
+    await sleep(t.arrowSlide + t.targetPause);
+    for (let j = i + 1; j < N; j++) {
+      setBox(cols[j], 'scan');
+      await sleep(t.scan);
+      if (cols[j].value < cols[min].value) {
+        setBox(cols[min], null);
+        min = j;
+        setBox(cols[min], 'box');
+      } else {
+        setBox(cols[j], null);
+      }
+    }
+    if (min !== i) await swap(i, min, t);
+    setBox(cols[i], null);
+  }
+  hideAllOverlays();
+}
+
+// ============================================================
+// Insertion sort
+//   rule : boundary between sorted (left) and unsorted (right)
+//   key  : boxed and fully lifted until placed
+//   Comparisons run leftward, half-lifting each item as it is examined.
+//   Once the spot is found, all items that must move are half-lifted
+//   and slide right together while the key drops into the gap.
+// ============================================================
+async function insertionSort() {
+  const t = T.insertion;
+  for (let i = 1; i < N; i++) {
+    showOverlay(rule, i, t.ruleSlide);     // slides while the key lifts
+    const key = cols[i];
+    setBox(key, 'box');
+    setLift(key, 'full', t.keyLift);
+    await sleep(t.keyLift + t.keyPause);
+
+    // Scan leftward to find where the key belongs.
+    let j = i - 1;
+    while (j >= 0) {
+      setLift(cols[j], 'half', t.examineLift);
+      await sleep(t.examineLift + t.examinePause);
+      const bigger = cols[j].value > key.value;
+      setLift(cols[j], null, t.examineDrop);
+      await sleep(t.examineDrop);
+      if (!bigger) break;
+      j--;
+    }
+    const target = j + 1;
+
+    // Slide the larger items right and drop the key into place.
+    // The shifted items and the key are set down together.
+    let dropWait = t.keyDrop;
+    if (target < i) {
+      const movers = cols.slice(target, i);
+      movers.forEach(c => setLift(c, 'half', t.slideLift));
+      await sleep(t.slideLift);
+      movers.forEach((c, k) => placeCol(c, target + k + 1, t.slideMove));
+      placeCol(key, target, t.slideMove);
+      await sleep(t.slideMove);
+      movers.forEach(c => setLift(c, null, t.slideDrop));
+      dropWait = Math.max(t.keyDrop, t.slideDrop);
+      cols.splice(i, 1);
+      cols.splice(target, 0, key);
+    }
+    setLift(key, null, t.keyDrop);
+    await sleep(dropWait);
+    setBox(key, null);
+  }
+  hideAllOverlays();
+}
+
+// ============================================================
+// Controls: buttons are disabled while an animation runs. The button that
+// started it is marked "active" so it stays at full strength as a reminder
+// of what is being shown.
+// ============================================================
+// dim = false disables the buttons without dimming them (for brief actions).
+async function run(fn, btn, dim = true) {
+  if (running) return;
+  running = true;
+  buttons.forEach(b => b.disabled = true);
+  btn.classList.add('active');
+  controls.classList.toggle('noDim', !dim);
+  hideAllOverlays();
+  try {
+    await fn();
+  } finally {
+    running = false;
+    buttons.forEach(b => b.disabled = false);
+    btn.classList.remove('active');
+    controls.classList.remove('noDim');
+  }
+}
+
+// e.currentTarget is the button whose handler is running.
+document.getElementById('btnShuffle').onclick    = () => { if (!running) shuffle(); };
+document.getElementById('btnDisplace').onclick   = e => run(displace, e.currentTarget, false);
+document.getElementById('btnBubble').onclick     = e => run(() => bubbleSort(false), e.currentTarget);
+document.getElementById('btnBubbleStar').onclick = e => run(() => bubbleSort(true), e.currentTarget);
+document.getElementById('btnSelection').onclick  = e => run(selectionSort, e.currentTarget);
+document.getElementById('btnInsertion').onclick  = e => run(insertionSort, e.currentTarget);
+
+build();
+</script>
+</body>
+</html>

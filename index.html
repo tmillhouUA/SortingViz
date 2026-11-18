@@ -180,7 +180,7 @@
     margin-top: 1vh;
   }
   #controls button {
-    font-size: var(--font);
+    font-size: calc(var(--font) * 0.75);   /* padding/min-width are in em, so they shrink too */
     padding: 0.6em 1.2em;
     border: 2px solid #888;
     border-radius: 8px;
@@ -191,7 +191,9 @@
   #controls button:hover:not(:disabled) { background: #e6e6e6; }
   #controls button:disabled { opacity: 0.45; cursor: default; }
   #controls button.active:disabled { opacity: 1; }   /* the running one stays bright */
-  #controls.noDim button:disabled { opacity: 1; }    /* brief actions: disable without dimming */
+  /* brief actions: disable without dimming (play controls are managed separately) */
+  #controls.noDim button:not(.play):disabled { opacity: 1; }
+  #btnPause { min-width: 7em; }   /* keeps the row from shifting between Pause and Resume */
   .sep {
     width: 2px;
     background: #999;
@@ -222,6 +224,10 @@
     <button id="btnBubbleStar">Bubble*</button>
     <button id="btnSelection">Selection</button>
     <button id="btnInsertion">Insertion</button>
+    <div class="sep"></div>
+    <button id="btnPause" class="play">Pause</button>
+    <button id="btnSpeed" class="play">Speed 1x</button>
+    <button id="btnReset" class="play">Reset</button>
   </div>
 
 <script>
@@ -230,6 +236,7 @@
 // ============================================================
 const N = 40;               // number of items (also set as --n in CSS)
 const DISPLACE_PAIRS = 1;   // adjacent swaps per Displace press
+const SPEEDS = [1, 2, 4, 8];  // speed multipliers cycled by the Speed button
 const verbose = false;      // set true for console logging
 
 // ------------------------------------------------------------
@@ -295,17 +302,50 @@ const T = {
 // cols[pos] is the column object currently in slot `pos`.
 // Each column: { value, el, numEl }
 let cols = [];
-let running = false;
+let running = false;    // any animation (sort or Displace) in progress
+let sorting = false;    // a sort in progress (running or paused)
+let paused = false;
+let aborted = false;    // set by Reset; makes the running sort stop at its next step
+let speed = 1;          // current speed multiplier (one of SPEEDS)
+let snapshot = null;    // arrangement just before the last sort started (for Reset)
 
 const barsArea = document.getElementById('barsArea');
 const pairBox  = document.getElementById('pairBox');
 const rule     = document.getElementById('rule');
 const arrow    = document.getElementById('arrow');
-const buttons  = document.querySelectorAll('#controls button');
 const controls = document.getElementById('controls');
+const buttons  = document.querySelectorAll('#controls button:not(.play)');  // all but play controls
+const btnPause = document.getElementById('btnPause');
+const btnSpeed = document.getElementById('btnSpeed');
+const btnReset = document.getElementById('btnReset');
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const log = (...args) => { if (verbose) console.log(...args); };
+
+// ============================================================
+// Speed, pause, and reset support
+// ============================================================
+// Thrown inside a sort to stop it when Reset is pressed.
+class ResetSignal extends Error {}
+
+// Pausable sleep used by all animations. After the delay it holds while
+// paused (polling every 50 ms), then stops the sort if Reset was pressed.
+async function wait(ms) {
+  await sleep(ms);
+  while (paused && !aborted) await sleep(50);
+  if (aborted) throw new ResetSignal();
+}
+
+// Wrap a timing group from T so every value read is divided by the current
+// speed. The values are read live (via getters), so a speed change takes
+// effect at the next step of a running sort.
+function scaled(group) {
+  const out = {};
+  for (const key of Object.keys(group)) {
+    Object.defineProperty(out, key, { get: () => group[key] / speed });
+  }
+  return out;
+}
 
 // ============================================================
 // Building and positioning columns
@@ -369,12 +409,25 @@ function hideAllOverlays() { [pairBox, rule, arrow].forEach(hideOverlay); }
 async function swap(i, j, t) {
   const a = cols[i], b = cols[j];
   setLift(a, 'full', t.lift); setLift(b, 'full', t.lift);
-  await sleep(t.lift);
+  await wait(t.lift);
   placeCol(a, j, t.move); placeCol(b, i, t.move);
-  await sleep(t.move);
+  await wait(t.move);
   setLift(a, null, t.drop); setLift(b, null, t.drop);
-  await sleep(t.drop);
+  await wait(t.drop);
   cols[i] = b; cols[j] = a;
+}
+
+// Put every column in its slot instantly, set down and unboxed, and clear
+// all overlays. Used by Shuffle and Reset.
+function placeAllInstantly() {
+  cols.forEach((c, pos) => { setLift(c, null, 0); setBox(c, null); placeCol(c, pos, 0); });
+  hideAllOverlays();
+}
+
+// Restore the arrangement from just before the last sort started.
+function restoreSnapshot() {
+  cols = snapshot.slice();
+  placeAllInstantly();
 }
 
 // ============================================================
@@ -386,8 +439,7 @@ function shuffle() {
     const j = Math.floor(Math.random() * (i + 1));
     [cols[i], cols[j]] = [cols[j], cols[i]];
   }
-  cols.forEach((c, pos) => { setLift(c, null, 0); setBox(c, null); placeCol(c, pos, 0); });
-  hideAllOverlays();
+  placeAllInstantly();
   log('shuffled:', cols.map(c => c.value).join(' '));
 }
 
@@ -397,7 +449,7 @@ async function displace() {
     const i = Math.floor(Math.random() * (N - 1));
     log('displace pair', i, i + 1);
     await swap(i, i + 1, T.displace);
-    await sleep(T.displace.pause);
+    await wait(T.displace.pause);
   }
 }
 
@@ -407,7 +459,7 @@ async function displace() {
 //   shrink = true (Bubble*): also skip the settled tail; a rule marks it
 // ============================================================
 async function bubbleSort(shrink) {
-  const t = shrink ? T.bubbleStar : T.bubble;
+  const t = scaled(shrink ? T.bubbleStar : T.bubble);
   let end = N;                    // slots [0, end) are still in play
   while (end > 1) {
     let swapped = false;
@@ -415,7 +467,7 @@ async function bubbleSort(shrink) {
       // Step 0 of a pass is the return trip to the left end.
       const slide = (i === 0) ? t.boxReturn : t.boxSlide;
       showOverlay(pairBox, i, slide);
-      await sleep(slide + t.compare);
+      await wait(slide + t.compare);
       if (cols[i].value > cols[i + 1].value) {
         await swap(i, i + 1, t);
         swapped = true;
@@ -437,15 +489,15 @@ async function bubbleSort(shrink) {
 //   scan  : lighter box on the item being checked
 // ============================================================
 async function selectionSort() {
-  const t = T.selection;
+  const t = scaled(T.selection);
   for (let i = 0; i < N - 1; i++) {
     showOverlay(arrow, i, t.arrowSlide);
     let min = i;
     setBox(cols[min], 'box');
-    await sleep(t.arrowSlide + t.targetPause);
+    await wait(t.arrowSlide + t.targetPause);
     for (let j = i + 1; j < N; j++) {
       setBox(cols[j], 'scan');
-      await sleep(t.scan);
+      await wait(t.scan);
       if (cols[j].value < cols[min].value) {
         setBox(cols[min], null);
         min = j;
@@ -469,22 +521,22 @@ async function selectionSort() {
 //   and slide right together while the key drops into the gap.
 // ============================================================
 async function insertionSort() {
-  const t = T.insertion;
+  const t = scaled(T.insertion);
   for (let i = 1; i < N; i++) {
     showOverlay(rule, i, t.ruleSlide);     // slides while the key lifts
     const key = cols[i];
     setBox(key, 'box');
     setLift(key, 'full', t.keyLift);
-    await sleep(t.keyLift + t.keyPause);
+    await wait(t.keyLift + t.keyPause);
 
     // Scan leftward to find where the key belongs.
     let j = i - 1;
     while (j >= 0) {
       setLift(cols[j], 'half', t.examineLift);
-      await sleep(t.examineLift + t.examinePause);
+      await wait(t.examineLift + t.examinePause);
       const bigger = cols[j].value > key.value;
       setLift(cols[j], null, t.examineDrop);
-      await sleep(t.examineDrop);
+      await wait(t.examineDrop);
       if (!bigger) break;
       j--;
     }
@@ -496,17 +548,17 @@ async function insertionSort() {
     if (target < i) {
       const movers = cols.slice(target, i);
       movers.forEach(c => setLift(c, 'half', t.slideLift));
-      await sleep(t.slideLift);
+      await wait(t.slideLift);
       movers.forEach((c, k) => placeCol(c, target + k + 1, t.slideMove));
       placeCol(key, target, t.slideMove);
-      await sleep(t.slideMove);
+      await wait(t.slideMove);
       movers.forEach(c => setLift(c, null, t.slideDrop));
       dropWait = Math.max(t.keyDrop, t.slideDrop);
       cols.splice(i, 1);
       cols.splice(target, 0, key);
     }
     setLift(key, null, t.keyDrop);
-    await sleep(dropWait);
+    await wait(dropWait);
     setBox(key, null);
   }
   hideAllOverlays();
@@ -517,33 +569,85 @@ async function insertionSort() {
 // started it is marked "active" so it stays at full strength as a reminder
 // of what is being shown.
 // ============================================================
-// dim = false disables the buttons without dimming them (for brief actions).
-async function run(fn, btn, dim = true) {
+// Options:
+//   dim  = false disables the buttons without dimming them (for brief actions).
+//   sort = true for the sorts: saves a snapshot for Reset and enables
+//          Pause/Resume while running.
+async function run(fn, btn, { dim = true, sort = true } = {}) {
   if (running) return;
   running = true;
+  sorting = sort;
+  if (sort) snapshot = cols.slice();   // shallow copy of the current order
+  else snapshot = null;                // Displace changes the data, so Reset no longer applies
   buttons.forEach(b => b.disabled = true);
   btn.classList.add('active');
   controls.classList.toggle('noDim', !dim);
   hideAllOverlays();
+  updatePlayControls();
   try {
     await fn();
+  } catch (e) {
+    if (!(e instanceof ResetSignal)) throw e;   // Reset is expected; anything else is a real error
+    log('sort stopped by Reset');
   } finally {
     running = false;
+    sorting = false;
+    paused = false;
+    aborted = false;
     buttons.forEach(b => b.disabled = false);
     btn.classList.remove('active');
     controls.classList.remove('noDim');
+    updatePlayControls();
   }
 }
 
+// Enable/label the play controls to match the current state.
+function updatePlayControls() {
+  btnPause.disabled = !sorting;
+  btnPause.textContent = paused ? 'Resume' : 'Pause';
+  btnSpeed.textContent = `Speed ${speed}x`;
+  btnReset.disabled = !snapshot;
+}
+
 // e.currentTarget is the button whose handler is running.
-document.getElementById('btnShuffle').onclick    = () => { if (!running) shuffle(); };
-document.getElementById('btnDisplace').onclick   = e => run(displace, e.currentTarget, false);
+document.getElementById('btnShuffle').onclick = () => {
+  if (running) return;
+  shuffle();
+  snapshot = null;          // new data, so Reset no longer applies
+  updatePlayControls();
+};
+document.getElementById('btnDisplace').onclick   = e => run(displace, e.currentTarget, { dim: false, sort: false });
 document.getElementById('btnBubble').onclick     = e => run(() => bubbleSort(false), e.currentTarget);
 document.getElementById('btnBubbleStar').onclick = e => run(() => bubbleSort(true), e.currentTarget);
 document.getElementById('btnSelection').onclick  = e => run(selectionSort, e.currentTarget);
 document.getElementById('btnInsertion').onclick  = e => run(insertionSort, e.currentTarget);
 
+btnPause.onclick = () => {
+  if (!sorting) return;
+  paused = !paused;
+  updatePlayControls();
+};
+
+btnSpeed.onclick = () => {
+  speed = SPEEDS[(SPEEDS.indexOf(speed) + 1) % SPEEDS.length];
+  updatePlayControls();
+};
+
+// Reset: put the pre-sort arrangement back immediately. If a sort is
+// running, also flag it to stop; it does so when its current step's wait
+// ends, and run() then re-enables the buttons.
+btnReset.onclick = () => {
+  if (!snapshot) return;
+  if (sorting) {
+    aborted = true;
+    paused = false;
+  }
+  restoreSnapshot();
+  updatePlayControls();
+};
+
 build();
+updatePlayControls();
 </script>
 </body>
 </html>
